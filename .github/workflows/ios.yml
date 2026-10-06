@@ -1,0 +1,145 @@
+# Compila um projeto Xcode (gerado no Windows pelo Unity) num Mac do GitHub e envia ao TestFlight.
+# O projeto NAO esta neste repositorio: e baixado de um servidor com uma chave guardada nos Segredos.
+# So dispara sob pedido (workflow_dispatch).
+name: iOS build
+
+on:
+  workflow_dispatch:
+    inputs:
+      pacote:
+        description: "Arquivo do pacote no servidor (ex.: g01_88.tar.gz)"
+        required: true
+        default: "g01_88.tar.gz"
+      numero_build:
+        description: "Numero do build (CFBundleVersion). Vazio = o que veio no pacote. A Apple exige um maior que o ultimo enviado."
+        required: false
+        default: ""
+      enviar:
+        description: "Enviar ao TestFlight? (nao = so compila e guarda o .ipa)"
+        required: true
+        default: "sim"
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.ASC_KEY_ID }}
+      APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.ASC_KEY_P8 }}
+      CERTIFICATE_PRIVATE_KEY: ${{ secrets.CERTIFICATE_PRIVATE_KEY }}
+    steps:
+      - name: Esconder textos sensiveis dos logs
+        env:
+          MASCARAS: ${{ secrets.MASCARAS }}
+        run: |
+          printf '%s\n' "$MASCARAS" | while IFS= read -r l; do [ -n "$l" ] && echo "::add-mask::$l"; done
+          true
+
+      - name: Xcode mais novo instalado
+        run: |
+          NOVO=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$NOVO/Contents/Developer"
+          xcodebuild -version
+
+      - name: Ferramentas de assinatura e envio
+        run: |
+          python3 -m venv "$HOME/cm"
+          "$HOME/cm/bin/pip" install --quiet codemagic-cli-tools
+          echo "$HOME/cm/bin" >> "$GITHUB_PATH"
+
+      - name: Baixar o projeto Xcode do servidor
+        env:
+          CHAVE_BUILD: ${{ secrets.CHAVE_BUILD }}
+          PACOTE: ${{ inputs.pacote }}
+        run: |
+          set -e
+          curl -fsSL --retry 3 -H "X-Chave-Build: $CHAVE_BUILD" \
+            -o projeto.tar.gz "https://jogosonline.top/_build/ios-g/$PACOTE"
+          tar -xzf projeto.tar.gz
+          # O pacote vem do Windows, que nao guarda a permissao de execucao do Mac.
+          find ios -type f \( -name "*.sh" -o ! -name "*.*" \) -exec chmod +x {} +
+          ls -l ios/usymtool ios/usymtoolarm64 ios/process_symbols.sh
+          # identificador do app lido do proprio projeto (nada fixo neste arquivo)
+          BUNDLE_ID=$(grep -h "PRODUCT_BUNDLE_IDENTIFIER = " ios/Unity-iPhone.xcodeproj/project.pbxproj | grep -v unity3d | head -1 | sed -E 's/.*= *"?([^";]+)"?;.*/\1/')
+          echo "::add-mask::$BUNDLE_ID"
+          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+
+      - name: Instalar os pods (Yodo1 MAS e dependencias)
+        run: |
+          cd ios && pod install --repo-update
+
+      - name: Embutir os frameworks dinamicos dos anuncios no app
+        run: |
+          # O CocoaPods liga os pods ao UnityFramework mas nao embute os frameworks dinamicos (AppLovin, FBAudienceNetwork,
+          # InMobi, Moloco...) em alvo de framework, e nao gera script de embutir para ele. Sem eles o app fecha na hora
+          # ao abrir (dyld: Library not loaded). Fase propria no app: copia do Pods para Frameworks/ e assina.
+          set -e
+          cat > ios/embed_dynamic_frameworks.sh <<'EOF'
+          #!/bin/bash
+          set -e
+          DEST="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"
+          mkdir -p "$DEST"
+          for n in AppHarbrSDK AppLovinSDK FBAudienceNetwork InMobiSDK MCSDKMaterialPlugin MolocoSDK; do
+            src=$(find "${SRCROOT}/Pods" -type d -name "$n.framework" -path "*ios-arm64*" ! -path "*simulator*" ! -path "*x86_64*" | head -1)
+            [ -n "$src" ] || src=$(find "${SRCROOT}/Pods" -type d -name "$n.framework" ! -path "*simulator*" ! -path "*x86_64*" | head -1)
+            [ -n "$src" ] || { echo "error: $n.framework nao encontrado em Pods"; exit 1; }
+            echo "embutindo $n de $src"
+            rsync -a --delete "$src/" "$DEST/$n.framework/"
+            if [ -n "${EXPANDED_CODE_SIGN_IDENTITY}" ]; then
+              codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" --preserve-metadata=identifier,entitlements "$DEST/$n.framework"
+            fi
+          done
+          EOF
+          sed -i '' 's/^          //' ios/embed_dynamic_frameworks.sh
+          chmod +x ios/embed_dynamic_frameworks.sh
+          find ios/Pods -type d \( -name "AppLovinSDK.framework" -o -name "MolocoSDK.framework" -o -name "MCSDKMaterialPlugin.framework" -o -name "AppHarbrSDK.framework" -o -name "InMobiSDK.framework" -o -name "FBAudienceNetwork.framework" \) | head -20
+          gem install xcodeproj --user-install --no-document
+          export GEM_PATH="$(ruby -e 'puts Gem.user_dir'):$(ruby -e 'puts Gem.dir')"
+          ruby -e '
+            require "xcodeproj"
+            proj = Xcodeproj::Project.open("ios/Unity-iPhone.xcodeproj")
+            app = proj.targets.find { |t| t.name == "Unity-iPhone" } or abort("sem alvo Unity-iPhone")
+            ph = app.new_shell_script_build_phase("Embutir frameworks dinamicos dos anuncios")
+            ph.shell_script = "\"${SRCROOT}/embed_dynamic_frameworks.sh\""
+            proj.save
+            puts "fase criada em " + app.name
+          '
+
+      - name: Assinatura (certificado e perfil na Apple)
+        run: |
+          set -e
+          keychain initialize
+          app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
+          keychain add-certificates
+          xcode-project use-profiles
+
+      - name: Numero do build
+        env:
+          NUMERO_BUILD: ${{ inputs.numero_build }}
+        run: |
+          if [ -n "$NUMERO_BUILD" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NUMERO_BUILD" ios/Info.plist
+          fi
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" -c "Print :CFBundleVersion" ios/Info.plist
+
+      - name: Compilar o .ipa
+        run: |
+          xcode-project build-ipa --workspace ios/Unity-iPhone.xcworkspace --scheme Unity-iPhone
+
+      - name: Conferir se os frameworks dinamicos entraram no .ipa
+        run: |
+          set -e
+          IPA=$(ls build/ios/ipa/*.ipa)
+          unzip -l "$IPA" | grep -o "Frameworks/[A-Za-z0-9_]*\.framework/" | sort -u
+          for f in AppLovinSDK FBAudienceNetwork InMobiSDK MolocoSDK AppHarbrSDK MCSDKMaterialPlugin; do
+            unzip -l "$IPA" | grep -q "Payload/[^/]*\.app/Frameworks/$f.framework/$f" || { echo "FALTA $f no .ipa"; exit 1; }
+          done
+
+      - name: Enviar ao TestFlight
+        if: ${{ inputs.enviar == 'sim' }}
+        run: |
+          app-store-connect publish --path build/ios/ipa/*.ipa
